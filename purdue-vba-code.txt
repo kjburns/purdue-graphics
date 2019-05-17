@@ -1,0 +1,262 @@
+Option Explicit
+
+Type Red5
+    phase As Integer
+    beginTime As Long
+End Type
+
+Dim detectorsOccupied(400 To 699) As Integer ' refers to stopline numbers. All stopline number arrays must have identical bounds
+Dim detectorsOccupiedStartTime(400 To 699) As Single ' refers to stopline numbers
+Dim detectorsOccupiedTime(400 To 699) As Single ' refers to stopline numbers
+Dim currentRun As Integer
+Dim currentTime As Long
+Dim currentSignalRow As Long
+Dim currentDetectorRow As Long
+Dim currentOutputRow As Long
+Dim lastGreenBegin(400 To 699) As Long ' refers to stopline numbers
+Dim lastGOR(400 To 699) As Single ' refers to stopline numbers
+Dim ongoingRed5s(10) As Red5 ' just a collection that is garbage collected by the checkRed5s function. Will need to be expanded if more than 11 phases can have a red start in the last five seconds.
+Dim sheet As Worksheet
+Dim firstSignalLineOfRunProcessed As Boolean
+Dim firstDetectorLineOfRunProcessed As Boolean
+
+Public Sub processEvents()
+    Application.Calculation = xlCalculationManual
+    Application.ScreenUpdating = False
+    Application.DisplayStatusBar = False
+    Application.EnableEvents = False
+
+    Call initializeModuleVariables
+    Call clearOutputArea
+    
+    firstDetectorLineOfRunProcessed = True ' this is a lie, but it's necessary to fake out a test below.
+    firstSignalLineOfRunProcessed = True ' this is a lie, but it's necessary to fake out a test below.
+        
+    Do
+        If (sheet.Cells(currentSignalRow + 1, 1) = "" And sheet.Cells(currentDetectorRow + 1, 8) = "") Then
+            Call cleanupEndOfRun
+            Exit Do
+        End If
+        
+        If (currentRun = 6) Then
+            Dim b As Integer
+            b = 0
+        End If
+
+        
+        If (sheet.Cells(currentDetectorRow, 8) <> sheet.Cells(currentDetectorRow + 1, 8) And _
+                sheet.Cells(currentSignalRow, 1) <> sheet.Cells(currentSignalRow + 1, 1) And _
+                firstDetectorLineOfRunProcessed And firstSignalLineOfRunProcessed) Then ' here is what it's faking out
+            cleanupEndOfRun
+            initializeNewRun
+        End If
+        
+        Do While currentSignalRow = 1 Or (sheet.Cells(currentSignalRow + 1, 2) <= currentTime)
+            If (currentSignalRow > 1 And sheet.Cells(currentSignalRow, 1) <> sheet.Cells(currentSignalRow + 1, 1) And firstSignalLineOfRunProcessed = True) Then
+                Exit Do
+            End If
+            
+            currentSignalRow = currentSignalRow + 1
+            processCurrentSignalEvent
+            firstSignalLineOfRunProcessed = True
+        Loop
+        
+        Do While (sheet.Cells(currentDetectorRow + 1, 10) <= currentTime _
+                And sheet.Cells(currentDetectorRow + 1, 11) <= currentTime)
+            If (currentDetectorRow > 1 And sheet.Cells(currentDetectorRow, 8) <> sheet.Cells(currentDetectorRow + 1, 8) And firstDetectorLineOfRunProcessed = True) Then
+                Exit Do
+            End If
+            
+            currentDetectorRow = currentDetectorRow + 1
+            processCurrentDetectorEvent
+            firstDetectorLineOfRunProcessed = True
+        Loop
+        
+        If (currentTime = 20200) Then
+            ' just a place to set a breakpoint for debugging since conditional breakpoints are not supported
+            Dim a As Integer
+            a = 0
+        End If
+        
+        checkRed5s
+        
+        currentTime = currentTime + 1
+        
+    Loop
+    
+    Application.EnableEvents = True
+    Application.DisplayStatusBar = True
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+End Sub
+
+Private Sub processCurrentSignalEvent()
+    Select Case Trim(sheet.Cells(currentSignalRow, 5))
+        Case "red"
+            Call registerNewRed(sheet.Cells(currentSignalRow, 6))
+        Case "amber"
+            Call registerEndOfGreen(sheet.Cells(currentSignalRow, 6))
+        Case "green"
+            Call registerStartOfGreen(sheet.Cells(currentSignalRow, 6))
+    End Select
+End Sub
+
+Private Sub registerStartOfGreen(stopLine As Integer)
+    lastGreenBegin(sheet.Cells(currentSignalRow, 6)) = currentTime
+    Call resetDetectorOccupiedTime(stopLine)
+End Sub
+
+Private Sub resetDetectorOccupiedTime(stopLine As Integer)
+    detectorsOccupiedTime(stopLine) = 0
+End Sub
+
+Private Sub registerEndOfGreen(stopLine As Integer)
+    Dim greenTime As Integer
+    greenTime = currentTime - lastGreenBegin(stopLine)
+    Dim occTime As Single
+    occTime = min(calculateDetectorOccTime(stopLine), greenTime)
+    
+    lastGOR(stopLine) = occTime / greenTime
+    Call resetDetectorOccupiedTime(stopLine)
+End Sub
+
+Private Sub processCurrentDetectorEvent()
+    Dim stopLine As Integer
+    stopLine = sheet.Cells(currentDetectorRow, 9) \ 10
+    
+    Dim timeIn As Single
+    timeIn = sheet.Cells(currentDetectorRow, 10)
+    If (timeIn > 0) Then
+        If (detectorsOccupied(stopLine) = 0) Then
+            detectorsOccupiedStartTime(stopLine) = timeIn
+        End If
+        
+        detectorsOccupied(stopLine) = detectorsOccupied(stopLine) + 1
+    End If
+    
+    Dim timeOut As Single
+    timeOut = sheet.Cells(currentDetectorRow, 11)
+    If (timeOut > 0) Then
+        detectorsOccupied(stopLine) = detectorsOccupied(stopLine) - 1
+        
+        If (detectorsOccupied(stopLine) = 0) Then
+            detectorsOccupiedTime(stopLine) = detectorsOccupiedTime(stopLine) + timeOut - detectorsOccupiedStartTime(stopLine)
+        End If
+    End If
+End Sub
+
+Private Function calculateDetectorOccTime(stopLine As Integer) As Single
+    Dim mostRecent As Single
+    If (detectorsOccupied(stopLine) > 0) Then
+        mostRecent = currentTime - detectorsOccupiedStartTime(stopLine)
+    Else
+        mostRecent = 0
+    End If
+    
+    calculateDetectorOccTime = mostRecent + detectorsOccupiedTime(stopLine)
+End Function
+
+Private Sub registerNewRed(stopLine As Integer)
+    Dim obj As Red5
+    obj.phase = stopLine
+    obj.beginTime = currentTime
+    
+    Dim i As Integer
+    For i = 0 To UBound(ongoingRed5s)
+        If (ongoingRed5s(i).phase = 0) Then ' using bottom value of zero to find a free slot
+            ongoingRed5s(i) = obj
+            Exit For
+        End If
+    Next i
+    
+    Call resetDetectorOccupiedTime(stopLine)
+End Sub
+
+Private Sub checkRed5s()
+    Dim i As Integer
+    For i = 0 To UBound(ongoingRed5s)
+        If (ongoingRed5s(i).phase <> 0) Then
+            If (ongoingRed5s(i).beginTime <= currentTime - 5) Then
+                Call flushRed5(i)
+                ongoingRed5s(i).phase = 0 ' can't make it Nothing (null) so use a bottom value instead. This is the garbage collection mechanism.
+            End If
+        End If
+    Next i
+End Sub
+
+Private Sub flushRed5(index As Integer)
+    Dim stopLine As Integer
+    stopLine = ongoingRed5s(index).phase
+    
+    Dim totalTime As Single
+    totalTime = currentTime - ongoingRed5s(index).beginTime
+    
+    Dim occTime As Single
+    occTime = detectorsOccupiedTime(stopLine)
+    If (detectorsOccupied(stopLine) > 0) Then
+        occTime = occTime + (currentTime - max(detectorsOccupiedStartTime(stopLine), ongoingRed5s(index).beginTime))
+    End If
+    
+    occTime = min(occTime, totalTime)
+    
+    Call outputPhaseData(stopLine, lastGOR(stopLine), occTime / totalTime)
+End Sub
+
+Private Function max(a, b)
+    If (a > b) Then
+        max = a
+    Else
+        max = b
+    End If
+End Function
+
+Private Function min(a, b)
+    If (a < b) Then
+        min = a
+    Else
+        min = b
+    End If
+End Function
+
+Private Sub outputPhaseData(stopLine As Integer, gor As Single, ror5 As Single)
+    sheet.Cells(currentOutputRow, 15) = currentTime
+    sheet.Cells(currentOutputRow, 16) = stopLine
+    sheet.Cells(currentOutputRow, 17) = gor
+    sheet.Cells(currentOutputRow, 18) = ror5
+    sheet.Cells(currentOutputRow, 19) = currentRun
+    
+    currentOutputRow = currentOutputRow + 1
+End Sub
+
+Private Sub initializeModuleVariables()
+    currentRun = 0
+    currentSignalRow = 1
+    currentDetectorRow = 1
+    currentOutputRow = 2
+    
+    Set sheet = Sheet1
+End Sub
+
+Private Sub clearOutputArea()
+    Sheet1.Range("o2:s999999").ClearContents
+    
+End Sub
+
+Private Sub initializeNewRun()
+    Dim i As Integer
+    For i = LBound(detectorsOccupied) To UBound(detectorsOccupied)
+        detectorsOccupied(i) = 0
+        lastGreenBegin(i) = 99999
+    Next i
+    
+    currentRun = currentRun + 1
+    currentTime = 0
+    firstDetectorLineOfRunProcessed = False
+    firstSignalLineOfRunProcessed = False
+End Sub
+
+Private Sub cleanupEndOfRun()
+    ' TODO output ongoing greens or reds onset in last 5 seconds
+    ' It makes such a small difference in the results, leaving it alone for now.
+    ' At worst we miss the final cycle of a phase, but only if the it's turned red in the last five seconds.
+End Sub
